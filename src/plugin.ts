@@ -201,10 +201,20 @@ function createChatCompletionChunk(id: string, created: number, model: string, d
 }
 
 function getGlobalKey(): string {
-  return "__opencode_cursor_proxy_server__";
+  // Single shared proxy for all instances
+  return `__opencode_cursor_proxy_server__`;
 }
 
-async function ensureCursorProxyServer(workspaceDirectory: string): Promise<string> {
+// Global session → directory map shared across all requests
+function getSessionDirectoryMap(): Map<string, string> {
+  const g = globalThis as any;
+  if (!g.__opencode_session_directory_map__) {
+    g.__opencode_session_directory_map__ = new Map<string, string>();
+  }
+  return g.__opencode_session_directory_map__;
+}
+
+async function ensureCursorProxyServer(): Promise<string> {
   const key = getGlobalKey();
   const g = globalThis as any;
 
@@ -215,6 +225,9 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
 
   // Mark as starting to avoid duplicate starts in-process.
   g[key] = { baseURL: "" };
+
+  // Get the shared session→directory map
+  const sessionDirectoryMap = getSessionDirectoryMap();
 
   const handler = async (req: Request): Promise<Response> => {
     try {
@@ -227,11 +240,46 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
         });
       }
 
+      // Endpoint to register session → directory mappings from other processes
+      if (url.pathname === "/register-session" && req.method === "POST") {
+        try {
+          const regBody = await req.json().catch(() => ({}));
+          const sessionID = typeof regBody?.sessionID === "string" ? regBody.sessionID : null;
+          const directory = typeof regBody?.directory === "string" ? regBody.directory : null;
+          if (sessionID && directory) {
+            sessionDirectoryMap.set(sessionID, directory);
+          }
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch {
+          return new Response(JSON.stringify({ ok: false }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+
       if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
         return openAIError(404, `Unsupported path: ${url.pathname}`);
       }
 
       const body = await req.json().catch(() => ({}));
+
+      // Extract sessionID from apiKey field (format: "cursor-agent||sessionID")
+      const rawApiKey = typeof body?.apiKey === "string" ? body.apiKey : "";
+      let extractedSessionID: string | null = null;
+      if (rawApiKey.includes("||")) {
+        const parts = rawApiKey.split("||");
+        extractedSessionID = parts[1] || null;
+      }
+
+      // Look up session directory from the shared map (registered by chat.params)
+      const mappedDirectory = extractedSessionID ? sessionDirectoryMap.get(extractedSessionID) : null;
+      const workspaceDirectory = mappedDirectory || process.cwd();
+
       const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
       let selectedModel = normalizeCursorAgentModel(model);
 
@@ -466,15 +514,16 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
 
   const bunAny = globalThis as any;
   if (typeof bunAny.Bun !== "undefined" && typeof bunAny.Bun.serve === "function") {
-    // If another process already started a proxy on the default port, reuse it.
+    // Check if an existing proxy is already running on the default port.
     try {
       const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
       if (res && res.ok) {
+        // Reuse existing proxy - all instances share the same proxy
         g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
         return CURSOR_PROXY_DEFAULT_BASE_URL;
       }
     } catch {
-      // ignore
+      // ignore - will try to start server
     }
 
     const startServer = (port: number) => {
@@ -496,7 +545,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
         throw error;
       }
 
-      // Something is already bound to the default port. Only reuse it if it looks like our proxy.
+      // Default port is taken by something else. Check if it's our proxy.
       try {
         const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
         if (res && res.ok) {
@@ -507,7 +556,7 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
         // ignore
       }
 
-      // Fallback: start on a random free port.
+      // Start on a random port as fallback
       const server = startServer(0);
       const baseURL = `http://${CURSOR_PROXY_HOST}:${server.port}/v1`;
       g[key].baseURL = baseURL;
@@ -518,8 +567,9 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
   throw new Error("Cursor proxy server requires Bun runtime");
 }
 
-export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) => {
-  const proxyBaseURL = await ensureCursorProxyServer(directory);
+export const CursorAuthPlugin: Plugin = async ({ $, client, directory: pluginDirectory }: PluginInput) => {
+  // Single shared proxy for all instances
+  const proxyBaseURL = await ensureCursorProxyServer();
 
   return {
     auth: {
@@ -560,9 +610,35 @@ export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) =>
         return;
       }
 
-      // Always point to the actual proxy base URL (may be dynamically allocated).
+      // Get the actual session directory (may differ from pluginDirectory if user switched projects)
+      let sessionDirectory = pluginDirectory;
+      try {
+        const session = await client.session.get({ path: { id: input.sessionID } });
+        if (session.data?.directory) {
+          sessionDirectory = session.data.directory;
+        }
+      } catch {
+        // Fall back to plugin directory
+      }
+
+      // Register session → directory mapping with the shared proxy via HTTP
+      // This is necessary because each opencode instance runs in a separate process
+      // and globalThis Maps are not shared across processes
+      const proxyRoot = proxyBaseURL.replace('/v1', '');
+      try {
+        await fetch(`${proxyRoot}/register-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionID: input.sessionID, directory: sessionDirectory }),
+        });
+      } catch {
+        // Ignore registration failures
+      }
+
+      // Point to the shared proxy
       output.options.baseURL = proxyBaseURL;
-      output.options.apiKey = output.options.apiKey || "cursor-agent";
+      // Encode sessionID in apiKey since it gets passed through to the proxy
+      output.options.apiKey = `cursor-agent||${input.sessionID}`;
     },
   };
 };
