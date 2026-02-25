@@ -205,6 +205,19 @@ function getGlobalKey(): string {
   return `__opencode_cursor_proxy_server__`;
 }
 
+async function fetchWithTimeout(url: string, timeoutMs: number = 500): Promise<Response | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    return res;
+  } catch {
+    clearTimeout(timeoutId);
+    return null;
+  }
+}
+
 // Global session → directory map shared across all requests
 function getSessionDirectoryMap(): Map<string, string> {
   const g = globalThis as any;
@@ -516,7 +529,7 @@ async function ensureCursorProxyServer(): Promise<string> {
   if (typeof bunAny.Bun !== "undefined" && typeof bunAny.Bun.serve === "function") {
     // Check if an existing proxy is already running on the default port.
     try {
-      const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
+      const res = await fetchWithTimeout(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`, 500);
       if (res && res.ok) {
         // Reuse existing proxy - all instances share the same proxy
         g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
@@ -547,7 +560,7 @@ async function ensureCursorProxyServer(): Promise<string> {
 
       // Default port is taken by something else. Check if it's our proxy.
       try {
-        const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
+        const res = await fetchWithTimeout(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`, 500);
         if (res && res.ok) {
           g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
           return CURSOR_PROXY_DEFAULT_BASE_URL;
